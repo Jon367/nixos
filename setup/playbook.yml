@@ -1,0 +1,230 @@
+---
+- hosts: vm
+  vars_prompt:
+
+    - name: device
+      prompt: What drive do you want to install this on? (sda, vda, nvme0n1)
+      private: no
+
+    - name: endings
+      prompt: For the partition numbering is it pX? If yes, write p then press enter.
+      private: no
+
+    - name: encryption_pass
+      prompt: Drive encryption password?
+      private: yes
+  vars:
+    install_drive: "/dev/{{ device }}"
+    boot_part: "{{ install_drive }}{{ endings }}1"
+    lvm_part: "{{ install_drive }}{{ endings }}2"
+
+  remote_user: root
+  tasks:
+
+    #    - name: Wipe disk
+    #  command: wipefs -a {{ install_drive }}
+
+    - name: Create efi part
+      parted:
+        device: '{{ install_drive }}'
+        label: gpt
+        number: 1
+        part_end: 512MB
+        name: efi
+        flags: [boot, esp]
+        state: present
+
+    - name: Create root partition
+      parted:
+        device: '{{ install_drive }}'
+        label: gpt
+        number: 3
+        part_start: 4609MB
+        name: root
+        state: present
+
+    - name: Create FAT32 filesystem in boot partition
+      filesystem:
+        dev: '{{ boot_part }}'
+        fstype: vfat
+        opts: -F32
+        force: yes
+
+    - name: make key for nixos
+      command: dd if=/dev/urandom of=/root/keyfile0.bin bs=1024 count=4
+
+      # cryptsetup luksFormat --type luks1 -c aes-xts-plain64 -s 256 -h sha512 {{ lvm_part }}
+      # cryptsetup luksAddKey {{ lvm_part }} keyfile0.bin
+      # cryptsetup luksOpen {{ lvm_part }} cryptroot -d keyfile0.bin
+
+    - name: dm-crypt setup luks
+      community.crypto.luks_device:
+        device: "{{ lvm_part }}"
+        cipher: aes-xts-plain64
+        hash: sha512
+        keysize: 256
+        type: luks1
+        passphrase: "{{ encryption_pass }}"
+        name: cryptroot
+        state: opened
+
+    - name: adding keyfile to luks
+      community.crypto.luks_device:
+        device: "{{ lvm_part }}"
+        new_keyfile: /root/keyfile0.bin
+        passphrase: "{{ encryption_pass }}"
+
+    - name: creating lvm pv and vg
+      lvg:
+        vg: vg
+        pvs: /dev/mapper/cryptroot
+        pesize: 16
+
+    - name: task for creating logical volume
+      lvol:
+        vg: vg
+        lv: swap
+        size: 4g
+        force: yes
+
+    - name: task for creating logical volume
+      lvol:
+        vg: vg
+        lv: root
+        size: 100%FREE
+        force: yes
+
+    # https://wiki.archlinux.org/title/Dm-crypt/Encrypting_an_entire_system
+    - name: Create filesystem in root volume
+      filesystem:
+        dev: "/dev/vg/root"
+        opts: -L root
+        fstype: "btrfs"
+
+    - name: Mount root filesystem
+      command: mount -t btrfs /dev/vg/root /mnt
+
+    - name: Make swap
+      command: mkswap -L swap /dev/vg/swap
+    - name: Enable swap
+      command: swapon /dev/vg/swap
+         
+    - command: btrfs subvolume create /mnt/root
+    - command: btrfs subvolume create /mnt/home
+    - command: btrfs subvolume create /mnt/nix
+    - command: btrfs subvolume create /mnt/persist
+    - name: Remove log directory
+      file:
+        path: /mnt/log
+        state: absent
+    - name: Continue
+      command: btrfs subvolume create /mnt/log
+
+
+    - name: Creating empty snapshot of root
+      command: btrfs subvolume snapshot -r /mnt/root /mnt/root-blank
+
+    - name: Unmounting /mnt
+      command: umount /mnt
+
+    - name: Mounting root
+      command: mount -o subvol=root,compress=zstd,noatime /dev/vg/root /mnt
+
+    - name: mkdiring home
+      file:
+        path: /mnt/home
+        state: directory
+    - name: Mounting home
+      command: mount -o subvol=home,compress=zstd,noatime /dev/vg/root /mnt/home
+
+    - name: mkdiring nix
+      file:
+        path: /mnt/nix
+        state: directory
+    - name: mounting nix
+      command: mount -o subvol=nix,compress=zstd,noatime /dev/vg/root /mnt/nix
+
+    - name: mkdiring persist
+      file:
+        path: /mnt/persist
+        state: directory
+    - name: mounting persist
+      command: mount -o subvol=persist,compress=zstd,noatime /dev/vg/root /mnt/persist
+
+    - name: mkdiring log
+      file:
+        path: /mnt/var/log
+        state: directory
+        recurse: yes
+    - name: moounting log
+      command: mount -o subvol=log,compress=zstd,noatime /dev/vg/root /mnt/var/log
+
+    - name: Mounting /boot
+      mount:
+        path: /mnt/boot/efi
+        src: '{{ boot_part }}'
+        fstype: vfat
+        state: mounted
+        fstab: /tmp/tmp.fstab
+
+    - name: copying keys
+      file:
+        path: /mnt/etc/secrets/initrd/
+        state: directory
+        recurse: yes
+
+    - file:
+        path: /mnt/etc/secrets/initrd
+        mode: 0000
+
+    - name: Generating config!!
+      command: nixos-generate-config --root /mnt
+
+    - name: making /var/log happen during boot
+      lineinfile:
+        path: /mnt/etc/nixos/hardware-configuration.nix
+        insertafter: '^      options = \[ "subvol=log" \];$'
+        line: '      neededForBoot = true;'
+        state: present
+
+    - name: setting correct mount options
+      lineinfile:
+        path: /mnt/etc/nixos/hardware-configuration.nix
+        line: '      options = [ "subvol={{ item.subvol }}" "compress=zstd" "noatime" ];'
+        regexp: '^      options = \[ "subvol={{ item.subvol }}" \];$'
+      loop:
+        - subvol: root
+        - subvol: home
+        - subvol: nix
+        - subvol: persist
+        - subvol: log
+
+    - name: finding all .nix files in ..
+      find: paths="../" patterns="*.nix"
+      register: nix_files
+
+     - name: copying configuration.nix
+       copy:
+         src: "{{ item }}"
+         dest: /mnt/etc/nixos/
+         owner: root
+         group: root
+         mode: u=rw,g=r,o=r
+       with_fileglob:
+         - "../*.nix"
+
+    - name: get lvm_part uuid
+      command: 'blkid -s UUID -o value {{ lvm_part }}'
+      register: disk_uuid
+
+    - name: set root drive for grub in configuration.nix
+      lineinfile:
+        path: /mnt/etc/nixos/configuration.nix
+        regexp: '^      device = "/dev/disk/by-uuid/'
+        line: '   device = "/dev/disk/by-uuid/{{ disk_uuid.stdout }}";'
+
+    - name: install-nix
+      command: nixos-install
+      register: install_out
+
+    - debug: var=install_out.stdout_lines

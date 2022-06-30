@@ -1,0 +1,36 @@
+---
+- hosts: vm
+  vars_prompt:
+
+    - name: device
+      prompt: What drive do you want to install this on? (sda, vda, nvme0n1)
+      private: no
+
+    - name: endings
+      prompt: For the partition numbering is it pX? If yes, write p then press enter.
+      private: no
+
+  vars:
+    install_drive: "/dev/{{ device }}"
+    lvm_part: "{{ install_drive }}{{ endings }}2"
+
+  remote_user: root
+  tasks:
+    - name: copying configuration.nix
+      copy:
+        src: "{{ item }}"
+        dest: /mnt/etc/nixos/
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+      with_fileglob:
+        - "../*.nix"
+    - name: get lvm_part uuid
+      command: 'blkid -s UUID -o value {{ lvm_part }}'
+      register: disk_uuid
+
+    - name: set root drive for grub in configuration.nix
+      lineinfile:
+        path: /mnt/etc/nixos/configuration.nix
+        regexp: '^      device = "/dev/disk/by-uuid/";'
+        line: '   device = "/dev/disk/by-uuid/{{ disk_uuid.stdout }}";'

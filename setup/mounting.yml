@@ -1,0 +1,78 @@
+---
+- hosts: vm
+  vars_prompt:
+
+    - name: device
+      prompt: What drive do you want to install this on? (sda, vda, nvme0n1)
+      private: no
+
+    - name: endings
+      prompt: For the partition numbering is it pX? If yes, write p then press enter.
+      private: no
+
+    - name: encryption_pass
+      prompt: Drive encryption password?
+      private: yes
+  vars:
+    install_drive: "/dev/{{ device }}"
+    boot_part: "{{ install_drive }}{{ endings }}1"
+    lvm_part: "{{ install_drive }}{{ endings }}2"
+
+  remote_user: root
+  tasks:
+    - name: dm-crypt setup luks
+      community.crypto.luks_device:
+        device: "{{ lvm_part }}"
+        cipher: aes-xts-plain64
+        hash: sha512
+        keysize: 256
+        type: luks1
+        passphrase: "{{ encryption_pass }}"
+        name: cryptroot
+        state: opened
+
+    - name: Mount root filesystem
+      command: mount -t btrfs /dev/vg/root /mnt
+
+    - name: Enable swap
+      command: swapon /dev/vg/swap
+         
+    - name: Mounting root
+      command: mount -o subvol=root,compress=zstd,noatime /dev/vg/root /mnt
+
+    - name: mkdiring home
+      file:
+        path: /mnt/home
+        state: directory
+    - name: Mounting home
+      command: mount -o subvol=home,compress=zstd,noatime /dev/vg/root /mnt/home
+
+    - name: mkdiring nix
+      file:
+        path: /mnt/nix
+        state: directory
+    - name: mounting nix
+      command: mount -o subvol=nix,compress=zstd,noatime /dev/vg/root /mnt/nix
+
+    - name: mkdiring persist
+      file:
+        path: /mnt/persist
+        state: directory
+    - name: mounting persist
+      command: mount -o subvol=persist,compress=zstd,noatime /dev/vg/root /mnt/persist
+
+    - name: mkdiring log
+      file:
+        path: /mnt/var/log
+        state: directory
+        recurse: yes
+    - name: moounting log
+      command: mount -o subvol=log,compress=zstd,noatime /dev/vg/root /mnt/var/log
+
+    - name: Mounting /boot
+      mount:
+        path: /mnt/boot/efi
+        src: '{{ boot_part }}'
+        fstype: vfat
+        state: mounted
+        fstab: /tmp/tmp.fstab
