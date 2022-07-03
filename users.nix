@@ -1,6 +1,7 @@
 { config, pkgs, ... }:
 
 {
+  programs.fish.enable = true;
   users.mutableUsers = false;
   users.users.root.hashedPassword = "$6$eBqRRr/VdidVdyze$FsyrZOvU6MLyW/LHUGs8.OfYkhC.YnPg85XXFi4L348ANfGebDU6jHGbUTC3XHd55KYtyXoD3ePuNcHQ2nqA81";
 
